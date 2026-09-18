@@ -25,6 +25,7 @@ import json
 import logging
 import multiprocessing
 import time
+from collections.abc import Iterable
 from typing import Any, Literal, Optional, Union
 
 import ifcopenshell
@@ -39,6 +40,182 @@ from deepdiff import DeepDiff
 from orderly_set import StableSet
 
 __version__ = version = "0.0.0"
+
+
+def resolve_mapped_item(mapped_item, processed_ids=None):
+    if processed_ids is None:
+        processed_ids = []
+
+    if id(mapped_item) in processed_ids:
+        return []
+    processed_ids.append(id(mapped_item))
+
+    mapping_source = mapped_item.MappingSource
+    if not mapping_source:
+        return []
+
+    mapped_representation = mapping_source.MappedRepresentation
+    if not mapped_representation:
+        return []
+
+    result = []
+
+    for item in mapped_representation.Items or []:
+        if item.is_a("IfcMappedItem"):
+            result.extend(resolve_mapped_item(item, processed_ids))
+        else:
+            result.append(item)
+
+    return result
+
+
+def find_mapped_items_in_representation(representation):
+    result = []
+    for rep in representation.Representations:
+        if not rep.is_a("IfcShapeRepresentation"):
+            continue
+
+        for item in rep.Items or []:
+            if item.is_a("IfcMappedItem"):
+                result.extend(resolve_mapped_item(item))
+            else:
+                result.append(item)
+
+    return result
+
+
+def get_colors_from_face_set(face_set):
+    if not hasattr(face_set, "HasColours") or not face_set.HasColours:
+        return []
+
+    result = []
+
+    for colour_map in face_set.HasColours:
+        if colour_map.is_a("IfcIndexedColourMap"):
+            result.append(colour_map)
+
+    return result
+
+
+def get_styled_items_from_faceted_brep(brep):
+    if not hasattr(brep, "Outer"):
+        return []
+
+    outer = brep.Outer
+    if not outer:
+        return []
+
+    result = []
+
+    for face in outer.CfsFaces or []:
+        if not hasattr(face, "StyledByItem"):
+            continue
+        for styled_item in face.StyledByItem or []:
+            if styled_item.is_a("IfcStyledItem"):
+                result.append(styled_item)
+    return result
+
+
+def get_material_representations_from_material(material):
+    if not hasattr(material, "HasRepresentation"):
+        return []
+
+    result = []
+    for mat_rep in material.HasRepresentation or []:
+        if mat_rep.is_a("IfcMaterialDefinitionRepresentation"):
+            result.append(mat_rep)
+
+    return result
+
+
+def get_material_representations_from_constituent_set(constituent_set):
+    result = []
+
+    for con in constituent_set.MaterialConstituents or []:
+        if not hasattr(con, "Material"):
+            continue
+
+        result.extend(get_material_representations_from_material(con.Material))
+
+    return result
+
+
+def get_material_representations_from_layer_set_usage(set_usage):
+    if not hasattr(set_usage, "ForLayerSet"):
+        return []
+
+    layer_set = set_usage.ForLayerSet
+    if not layer_set or not hasattr(layer_set, "MaterialLayers"):
+        return []
+
+    result = []
+
+    for layer in layer_set.MaterialLayers or []:
+        if not hasattr(layer, "Material"):
+            continue
+
+        result.extend(get_material_representations_from_material(layer.Material))
+
+    return result
+
+
+def get_material_representations(element):
+    if not hasattr(element, "HasAssociations"):
+        return []
+
+    result = []
+
+    for rel in element.HasAssociations or []:
+        if not rel.is_a("IfcRelAssociatesMaterial"):
+            continue
+
+        rel_material = rel.RelatingMaterial
+
+        if rel_material.is_a("IfcMaterialConstituentSet"):
+            result.extend(get_material_representations_from_constituent_set(rel_material))
+        elif rel_material.is_a("IfcMaterialLayerSetUsage"):
+            result.extend(get_material_representations_from_layer_set_usage(rel_material))
+        elif rel_material.is_a("IfcMaterial"):
+            result.extend(get_material_representations_from_material(rel_material))
+        # IfcMaterialLayerSet, IfcMaterialProfileSet and IfcMaterialProfileSetUsage
+        # are omitted: Renga IFC export does not use them.
+
+    return result
+
+
+class Ifc2Dict:
+    def __init__(self, identifiable_classes=None):
+        self.identifiable_classes = identifiable_classes or ["IfcProduct"]
+
+    def isIdentifiable(self, object):
+        if "__dict__" not in dir(object):
+            return False
+        if "GlobalId" not in object.__dict__:
+            return False
+        for c in self.identifiable_classes:
+            if object.is_a(c):
+                return True
+        return False
+
+    def __call__(self, object, foldIdentifiable=False):
+        isSimpleValue = lambda object: object is None or isinstance(object, (str, int, float))
+        if isSimpleValue(object):
+            return object
+
+        if foldIdentifiable and self.isIdentifiable(object):
+            return "<{}::{}>".format(object.is_a(), object.GlobalId)
+
+        hasAttributes = lambda object: "__dict__" in dir(object)
+        if hasAttributes(object):
+            attributes = {key: self.__call__(object.__dict__[key], foldIdentifiable=True) for key in object.__dict__}
+            attributes = dict(filter(lambda key_value: key_value[1] is not None, attributes.items()))
+            return attributes
+
+        hasContent = lambda object: isinstance(object, Iterable)
+        if hasContent(object):
+            return [self.__call__(x, foldIdentifiable=True) for x in object]
+
+        return str(object)
 
 
 RELATIONSHIP_TYPE = Literal["geometry", "attributes", "type", "property", "container", "aggregate", "classification"]
