@@ -218,7 +218,9 @@ class Ifc2Dict:
         return str(object)
 
 
-RELATIONSHIP_TYPE = Literal["geometry", "attributes", "type", "property", "container", "aggregate", "classification"]
+RELATIONSHIP_TYPE = Literal[
+    "geometry", "attributes", "type", "property", "container", "aggregate", "classification", "inverse"
+]
 
 
 class IfcDiff:
@@ -237,6 +239,16 @@ class IfcDiff:
         that comparisons will take longer.
     :param filter_elements: An IFC filter query if you only want to compare a
         subset of elements. For example: ``IfcWall`` to only compare walls.
+        Takes precedence over identifiable_classes / comparable_classes.
+    :param identifiable_classes: IFC classes treated as identity-bearing when
+        expanding inverse relationships via Ifc2Dict. Combined with
+        comparable_classes to choose which elements to compare.
+    :param comparable_classes: IFC classes to scan for comparable elements
+        (typically ``IfcRoot``). An entity is compared if it is also one of
+        identifiable_classes.
+    :param inverse_relationship_classes: Inverse entity classes to DeepDiff
+        (typically ``IfcRelationship``). No-op unless "inverse" is in
+        relationships.
 
     Example::
 
@@ -260,6 +272,9 @@ class IfcDiff:
         relationships: Optional[list[RELATIONSHIP_TYPE]] = None,
         is_shallow: bool = True,
         filter_elements: Optional[str] = None,
+        identifiable_classes: Optional[list[str]] = None,
+        comparable_classes: Optional[list[str]] = None,
+        inverse_relationship_classes: Optional[list[str]] = None,
     ):
         self.old = old
         self.new = new
@@ -269,32 +284,17 @@ class IfcDiff:
         self.precision = 1e-4
         self.is_shallow = is_shallow
         self.filter_elements = filter_elements
+        self.identifiable_classes = identifiable_classes
+        self.comparable_classes = comparable_classes
+        self.inverse_relationship_classes = inverse_relationship_classes
 
     def diff(self) -> None:
         logging.disable(logging.CRITICAL)
 
         self.precision = self.get_precision()
 
-        if self.filter_elements:
-            old_elements = set(
-                e.GlobalId for e in ifcopenshell.util.selector.filter_elements(self.old, self.filter_elements)
-            )
-            new_elements = set(
-                e.GlobalId for e in ifcopenshell.util.selector.filter_elements(self.new, self.filter_elements)
-            )
-        else:
-            old_elements = self.old.by_type("IfcElement")
-            if self.old.schema == "IFC2X3":
-                old_elements += self.old.by_type("IfcSpatialStructureElement")
-            else:
-                old_elements += self.old.by_type("IfcSpatialElement")
-            old_elements = set(e.GlobalId for e in old_elements if not e.is_a("IfcFeatureElement"))
-            new_elements = self.new.by_type("IfcElement")
-            if self.new.schema == "IFC2X3":
-                new_elements += self.new.by_type("IfcSpatialStructureElement")
-            else:
-                new_elements += self.new.by_type("IfcSpatialElement")
-            new_elements = set(e.GlobalId for e in new_elements if not e.is_a("IfcFeatureElement"))
+        old_elements = self.collect_element_global_ids(self.old)
+        new_elements = self.collect_element_global_ids(self.new)
 
         print(" - {} item(s) are in the old model".format(len(old_elements)))
         print(" - {} item(s) are in the new model".format(len(new_elements)))
@@ -376,6 +376,25 @@ class IfcDiff:
         print(" - {} item(s) were changed".format(len(self.change_register.keys())))
 
         logging.disable(logging.NOTSET)
+
+    def collect_element_global_ids(self, ifc: ifcopenshell.file) -> set[str]:
+        if self.filter_elements:
+            return set(e.GlobalId for e in ifcopenshell.util.selector.filter_elements(ifc, self.filter_elements))
+
+        if self.identifiable_classes and self.comparable_classes:
+            global_ids = set()
+            for class_name in self.comparable_classes:
+                for entity in ifc.by_type(class_name):
+                    if any(entity.is_a(ifc_class) for ifc_class in self.identifiable_classes):
+                        global_ids.add(entity.GlobalId)
+            return global_ids
+
+        elements = ifc.by_type("IfcElement")
+        if ifc.schema == "IFC2X3":
+            elements += ifc.by_type("IfcSpatialStructureElement")
+        else:
+            elements += ifc.by_type("IfcSpatialElement")
+        return set(e.GlobalId for e in elements if not e.is_a("IfcFeatureElement"))
 
     def summarise_shapes(
         self, ifc: ifcopenshell.file, elements: list[ifcopenshell.entity_instance]
@@ -516,6 +535,40 @@ class IfcDiff:
                 new_refs = [getattr(r, new_id) for r in ifcopenshell.util.classification.get_references(new)]
                 if old_refs != new_refs:
                     self.change_register.setdefault(new.GlobalId, {}).update({"classification_changed": True})
+                    return True
+            elif relationship == "inverse":
+                if not self.inverse_relationship_classes:
+                    continue
+
+                ifc_expander = Ifc2Dict(self.identifiable_classes)
+                old_relationships = [
+                    ifc_expander(x)
+                    for x in self.old.get_inverse(old)
+                    for c in self.inverse_relationship_classes
+                    if x.is_a(c)
+                ]
+                new_relationships = [
+                    ifc_expander(x)
+                    for x in self.new.get_inverse(new)
+                    for c in self.inverse_relationship_classes
+                    if x.is_a(c)
+                ]
+
+                diff = DeepDiff(
+                    old_relationships,
+                    new_relationships,
+                    significant_digits=6,
+                    ignore_string_type_changes=True,
+                    ignore_numeric_type_changes=True,
+                    ignore_order=True,
+                    exclude_regex_paths=[
+                        r".*\'id\'.*",
+                        r".*\'GlobalId\'.*",
+                        r"root.*SelfIntersect$",
+                    ],
+                )
+                if diff:
+                    self.change_register.setdefault(new.GlobalId, {}).update({"inverse_relations_changes": diff})
                     return True
 
     def diff_element_basic_geometry(self, old, new):
