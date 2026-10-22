@@ -24,6 +24,7 @@ import argparse
 import json
 import logging
 import multiprocessing
+import sys
 import time
 from collections.abc import Iterable
 from typing import Any, Literal, Optional, Union
@@ -288,6 +289,7 @@ class IfcDiff:
         self.identifiable_classes = identifiable_classes
         self.comparable_classes = comparable_classes
         self.inverse_relationship_classes = inverse_relationship_classes
+        self.equal = False
 
     def diff(self) -> None:
         logging.disable(logging.CRITICAL)
@@ -378,6 +380,10 @@ class IfcDiff:
 
         print(" - {} item(s) were changed".format(len(self.change_register.keys())))
 
+        self.equal = (
+            len(self.added_elements) == 0 and len(self.deleted_elements) == 0 and len(self.change_register) == 0
+        )
+
         logging.disable(logging.NOTSET)
 
     def collect_element_global_ids(self, ifc: ifcopenshell.file) -> set[str]:
@@ -456,11 +462,17 @@ class IfcDiff:
 
     def json_dump_default(self, obj):
         # result of DeepDiff may contain ordered sets
-        if isinstance(obj, (StableSet, set)):
+        if isinstance(obj, (StableSet, set, frozenset)):
+            return list(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if type(obj).__name__ in ("SetOrdered", "OrderedSet"):
             return list(obj)
         return json.JSONEncoder.default(None, obj)
 
-    def export(self, path: str) -> None:
+    def export(self, path: Optional[str] = None) -> None:
+        if path is None:
+            return
         with open(path, "w", encoding="utf-8") as diff_file:
             json.dump(
                 {
@@ -819,7 +831,7 @@ if __name__ == "__main__":
     parser.add_argument("old", type=str, help="The old IFC file")
     parser.add_argument("new", type=str, help="The new IFC file")
     parser.add_argument(
-        "-o", "--output", type=str, help="The JSON diff file to output. Defaults to diff.json", default="diff.json"
+        "-o", "--output", type=str, help="The JSON diff file to output. Defaults to no file.", default=None
     )
     parser.add_argument(
         "-r",
@@ -827,8 +839,8 @@ if __name__ == "__main__":
         type=str,
         help=(
             'A list of space-separated relationships, chosen from "attributes", "geometry", '
-            '"type", "property", "container", "aggregate", "classification". '
-            'Defaults to "attributes geometry" when omitted.'
+            '"type", "property", "container", "aggregate", "classification", "inverse". '
+            'Defaults to "attributes geometry inverse" when omitted.'
         ),
         default="",
     )
@@ -845,9 +857,20 @@ if __name__ == "__main__":
     print("# Loading finished in {:.2f} seconds".format(time.time() - start))
     start = time.time()
 
-    ifc_diff = IfcDiff(old, new, args.relationships.split())
+    ifc_diff = IfcDiff(
+        old,
+        new,
+        relationships=args.relationships.split() or ["attributes", "geometry", "inverse"],
+        is_shallow=False,
+        identifiable_classes=["IfcProduct", "IfcProject"],
+        comparable_classes=["IfcRoot"],
+        inverse_relationship_classes=["IfcRelationship"],
+    )
     ifc_diff.diff()
 
     print("# Diff finished in {:.2f} seconds".format(time.time() - start))
+    print("Equal: ", ifc_diff.equal)
 
     ifc_diff.export(args.output)
+
+    sys.exit(77 if ifc_diff.equal else 0)
