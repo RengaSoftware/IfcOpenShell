@@ -280,6 +280,7 @@ class IfcDiff:
         self.new = new
         self.change_register = {}
         self.representation_ids = {}
+        self.processed_representation_ids = set()
         self.relationships = relationships or ["attributes", "geometry"]
         self.precision = 1e-4
         self.is_shallow = is_shallow
@@ -292,6 +293,7 @@ class IfcDiff:
         logging.disable(logging.CRITICAL)
 
         self.precision = self.get_precision()
+        self.processed_representation_ids = set()
 
         old_elements = self.collect_element_global_ids(self.old)
         new_elements = self.collect_element_global_ids(self.new)
@@ -338,6 +340,7 @@ class IfcDiff:
                 if self.diff_element_relationships(old, new) and self.is_shallow:
                     continue
             if should_check_geometry:
+                self.diff_element_appearance(old, new)
                 # Option 1: check everything heuristically using the iterator (seems faster)
                 if ifcopenshell.util.representation.get_representation(new, "Model", "Body", "MODEL_VIEW"):
                     potential_old_changes.append(old)
@@ -631,19 +634,174 @@ class IfcDiff:
             return True
         return False
 
+    def record_deep_diff(self, global_id: str, key: str, old_value, new_value, **kwargs) -> bool:
+        settings = {
+            "significant_digits": 6,
+            "ignore_string_type_changes": True,
+            "ignore_numeric_type_changes": True,
+            "ignore_order": True,
+        }
+        settings.update(kwargs)
+        diff = DeepDiff(old_value, new_value, **settings)
+        if diff and global_id:
+            self.change_register.setdefault(global_id, {}).update({key: diff})
+            return True
+        return False
+
+    def product_representation(self, element: ifcopenshell.entity_instance):
+        if "Representation" in getattr(element, "__dict__", {}) and element.Representation is not None:
+            return element.Representation
+        return None
+
+    def diff_element_appearance(self, old, new) -> bool:
+        changed = self.diff_materials(old, new)
+
+        old_representation = self.product_representation(old)
+        new_representation = self.product_representation(new)
+        if not old_representation or not new_representation:
+            return changed
+
+        representation_id = self.get_representation_id(new)
+        if representation_id is not None:
+            if representation_id in self.processed_representation_ids:
+                return changed
+            self.processed_representation_ids.add(representation_id)
+
+        global_id = new.GlobalId
+        changed = self.diff_presentation_layer_assignment(global_id, old_representation, new_representation) or changed
+        changed = self.diff_shape_aspects(global_id, old_representation, new_representation) or changed
+        changed = self.diff_styled_items(global_id, old_representation, new_representation) or changed
+        changed = self.diff_colors(global_id, old_representation, new_representation) or changed
+        return changed
+
+    def diff_colors(self, global_id, old_representation, new_representation) -> bool:
+        old_mapped_items = find_mapped_items_in_representation(old_representation)
+        new_mapped_items = find_mapped_items_in_representation(new_representation)
+
+        def get_color_maps(items):
+            color_maps = []
+            for item in items:
+                if not item:
+                    continue
+                if not item.is_a("IfcPolygonalFaceSet") and not item.is_a("IfcTriangulatedFaceSet"):
+                    continue
+                color_maps.extend(get_colors_from_face_set(item))
+            return color_maps
+
+        def get_styled_items(items):
+            styled_items = []
+            for item in items:
+                if not item:
+                    continue
+                if not item.is_a("IfcFacetedBrep"):
+                    continue
+                styled_items.extend(get_styled_items_from_faceted_brep(item))
+            return styled_items
+
+        changed = self.record_deep_diff(
+            global_id, "color_maps_changed", get_color_maps(old_mapped_items), get_color_maps(new_mapped_items)
+        )
+        changed = (
+            self.record_deep_diff(
+                global_id,
+                "face_styled_items_changed",
+                get_styled_items(old_mapped_items),
+                get_styled_items(new_mapped_items),
+            )
+            or changed
+        )
+        return changed
+
+    def diff_materials(self, old_element, new_element) -> bool:
+        old_material_reps = get_material_representations(old_element)
+        new_material_reps = get_material_representations(new_element)
+
+        def get_styled_items(representation):
+            if not representation:
+                return []
+
+            styled_items = []
+            for rep in representation.Representations or []:
+                if not rep or not rep.is_a("IfcStyledRepresentation"):
+                    continue
+                for item in rep.Items or []:
+                    styled_items.append(item.Styles)
+            return styled_items
+
+        old_styled_items = []
+        new_styled_items = []
+        max_len = max(len(old_material_reps), len(new_material_reps))
+        for i in range(max_len):
+            old_rep = None if i >= len(old_material_reps) else old_material_reps[i]
+            new_rep = None if i >= len(new_material_reps) else new_material_reps[i]
+            old_styled_items.extend(get_styled_items(old_rep))
+            new_styled_items.extend(get_styled_items(new_rep))
+
+        return self.record_deep_diff(
+            new_element.GlobalId, "materials_changed", old_styled_items, new_styled_items
+        )
+
+    def diff_shape_aspects(self, global_id, old_representation, new_representation) -> bool:
+        def get_shape_aspects(representation, ifc_file):
+            return [item for item in ifc_file.get_inverse(representation) if item.is_a("IfcShapeAspect")]
+
+        return self.record_deep_diff(
+            global_id,
+            "shape_aspects_changed",
+            get_shape_aspects(old_representation, self.old),
+            get_shape_aspects(new_representation, self.new),
+        )
+
+    def diff_styled_items(self, global_id, old_representation, new_representation) -> bool:
+        def get_representation_styles(representation, ifc_file):
+            styles = []
+            for shape_representation in representation.Representations or []:
+                for item in shape_representation.Items or []:
+                    for styled_item in ifc_file.get_inverse(item):
+                        if styled_item.is_a("IfcStyledItem"):
+                            styles.append(styled_item.Styles)
+            return styles
+
+        return self.record_deep_diff(
+            global_id,
+            "styled_items_changed",
+            get_representation_styles(old_representation, self.old),
+            get_representation_styles(new_representation, self.new),
+        )
+
+    def diff_presentation_layer_assignment(self, global_id, old_representation, new_representation) -> bool:
+        def get_representation_layers(representation, ifc_file):
+            return [
+                assignment.Name
+                for shape_representation in representation.Representations or []
+                for assignment in ifc_file.get_inverse(shape_representation)
+                if assignment.is_a("IfcPresentationLayerAssignment")
+            ]
+
+        return self.record_deep_diff(
+            global_id,
+            "layer_assignment_changed",
+            get_representation_layers(old_representation, self.old),
+            get_representation_layers(new_representation, self.new),
+        )
+
     def get_representation_id(self, element: ifcopenshell.entity_instance) -> Union[int, None]:
-        if not element.Representation:
+        if "Representation" not in getattr(element, "__dict__", {}) or not element.Representation:
             return
         for representation in element.Representation.Representations:
             if not representation.is_a("IfcShapeRepresentation"):
                 continue
-            if (
-                representation.RepresentationIdentifier == "Body"
-                and representation.RepresentationType != "MappedRepresentation"
-            ):
+            if representation.RepresentationIdentifier not in ("Body", "Reference"):
+                continue
+            if representation.RepresentationType == "MappedRepresentation":
+                items = representation.Items or []
+                if not items:
+                    continue
+                mapping_source = items[0].MappingSource
+                if mapping_source and mapping_source.MappedRepresentation:
+                    return mapping_source.MappedRepresentation.id()
+            else:
                 return representation.id()
-            elif representation.RepresentationIdentifier == "Body":
-                return representation.Items[0].MappingSource.MappedRepresentation.id()
 
 
 class DiffTerminator:
