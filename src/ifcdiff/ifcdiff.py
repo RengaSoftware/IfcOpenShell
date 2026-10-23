@@ -409,11 +409,14 @@ class IfcDiff:
         self, ifc: ifcopenshell.file, elements: list[ifcopenshell.entity_instance]
     ) -> dict[str, dict[str, Any]]:
         shapes = {}
+        products = [e for e in elements if e.is_a("IfcProduct")]
+        if not products:
+            return shapes
         iterator = ifcopenshell.geom.iterator(
-            self.get_settings(ifc), ifc, multiprocessing.cpu_count(), include=elements
+            self.get_settings(ifc), ifc, multiprocessing.cpu_count(), include=products
         )
         valid_file = iterator.initialize()
-        while True:
+        while True and valid_file:
             shape = iterator.get()
             element = ifc.by_id(shape.id)
             geometry = shape.geometry
