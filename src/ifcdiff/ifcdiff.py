@@ -348,12 +348,12 @@ class IfcDiff:
                     potential_old_changes.append(old)
                     potential_new_changes.append(new)
                 # Option 2: check first using Python, then fallback to iterator (twice as slow)
-                # diff = self.diff_element_basic_geometry(old, new)
-                # if diff:
-                #    self.change_register.setdefault(new.GlobalId, {}).update({"geometry_changed": True})
-                # else:
-                #    potential_old_changes.append(old)
-                #    potential_new_changes.append(new)
+                diff = self.diff_element_basic_geometry(old, new)
+                if diff:
+                   self.change_register.setdefault(new.GlobalId, {}).update({"geometry_changed": True})
+                else:
+                   potential_old_changes.append(old)
+                   potential_new_changes.append(new)
 
         print(" - {} item(s) had simple changes".format(len(self.change_register.keys())))
 
@@ -602,47 +602,44 @@ class IfcDiff:
         if old_projections != new_projections:
             return True
         # Option 3: check completely using Python with get_info (extremely slow, not worth it)
-        # old_rep_id = self.get_representation_id(old)
-        # new_rep_id = self.get_representation_id(new)
-        # rep_result = self.representation_ids.get(new_rep_id, None)
-        # if rep_result is not None:
-        #    return rep_result
-        # if type(old_rep_id) != type(new_rep_id):
-        #    self.representation_ids[new_rep_id] = True
-        #    return True
-        # if new_rep_id is None:
-        #    return
-        # result = self.diff_representation(old_rep_id, new_rep_id) or False
-        # self.representation_ids[new_rep_id] = result
-        # return result
+        old_rep_id = self.get_representation_id(old)
+        new_rep_id = self.get_representation_id(new)
+        rep_result = self.representation_ids.get(new_rep_id, None)
+        if rep_result is not None:
+           return rep_result
+        if type(old_rep_id) != type(new_rep_id):
+           self.representation_ids[new_rep_id] = True
+           return True
+        if new_rep_id is None:
+           return
+        result = self.diff_representation(old_rep_id, new_rep_id, old.GlobalId) or False
+        self.representation_ids[new_rep_id] = result
+        return result
 
-    def diff_representation(self, old_rep_id: int, new_rep_id: int) -> bool:
+    def diff_representation(self, old_rep_id: int, new_rep_id: int, global_id) -> bool:
         old_rep = self.old.by_id(old_rep_id)
         new_rep = self.new.by_id(new_rep_id)
         if len(old_rep.Items) != len(new_rep.Items):
             return True
         for i, old_item in enumerate(old_rep.Items):
-            result = self.diff_representation_item(old_item, new_rep.Items[i])
+            result = self.diff_representation_item(old_item, new_rep.Items[i], global_id)
             if result is True:
                 return True
         return False
 
     def diff_representation_item(
-        self, old_item: ifcopenshell.entity_instance, new_item: ifcopenshell.entity_instance
-    ) -> bool:
+        self, old_item: ifcopenshell.entity_instance, new_item: ifcopenshell.entity_instance, global_id) -> bool:
         if old_item.is_a() != new_item.is_a():
             return True
-        try:
-            diff = DeepDiff(
-                old_item.get_info(recursive=True),
-                new_item.get_info(recursive=True),
-                custom_operators=[DiffTerminator()] if self.is_shallow else [],
-                math_epsilon=self.precision,
-                exclude_regex_paths=[r".*id']$"],
-            )
-        except:
-            return True
+        
+        diff = DeepDiff(
+            old_item.get_info(recursive=True),
+            new_item.get_info(recursive=True),                
+            math_epsilon=self.precision,
+            exclude_regex_paths=[r".*id']$"],
+        )        
         if diff:
+            self.change_register.setdefault(global_id, {}).update({"geometry_changed_details" : diff})
             return True
         return False
 
