@@ -587,11 +587,15 @@ class IfcDiff:
                     return True
 
     def diff_element_basic_geometry(self, old, new):
-        old_placement = ifcopenshell.util.placement.get_local_placement(old.ObjectPlacement)
-        new_placement = ifcopenshell.util.placement.get_local_placement(new.ObjectPlacement)
-        if not np.allclose(old_placement[:, 3], new_placement[:, 3], atol=self.precision):
-            return True
-        if not np.allclose(old_placement[0:3, 0:3], new_placement[0:3, 0:3], atol=1e-2):
+        has_placement = lambda e: "ObjectPlacement" in getattr(e, "__dict__", {}) and e.ObjectPlacement is not None
+        if has_placement(old) and has_placement(new):
+            old_placement = ifcopenshell.util.placement.get_local_placement(old.ObjectPlacement)
+            new_placement = ifcopenshell.util.placement.get_local_placement(new.ObjectPlacement)
+            if not np.allclose(old_placement[:, 3], new_placement[:, 3], atol=self.precision):
+                return True
+            if not np.allclose(old_placement[0:3, 0:3], new_placement[0:3, 0:3], atol=1e-2):
+                return True
+        elif has_placement(old) != has_placement(new):
             return True
         old_openings = sorted([o.RelatedOpeningElement.GlobalId for o in getattr(old, "HasOpenings", []) or []])
         new_openings = sorted([o.RelatedOpeningElement.GlobalId for o in getattr(new, "HasOpenings", []) or []])
