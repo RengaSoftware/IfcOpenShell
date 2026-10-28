@@ -601,31 +601,57 @@ class IfcDiff:
         if has_placement(old) and has_placement(new):
             old_placement = ifcopenshell.util.placement.get_local_placement(old.ObjectPlacement)
             new_placement = ifcopenshell.util.placement.get_local_placement(new.ObjectPlacement)
+            placement_details = {}
             if not np.allclose(old_placement[:, 3], new_placement[:, 3], atol=self.precision):
-                return True
+                placement_details["origin"] = {
+                    "old": np.asarray(old_placement[:3, 3]).tolist(),
+                    "new": np.asarray(new_placement[:3, 3]).tolist(),
+                }
             if not np.allclose(old_placement[0:3, 0:3], new_placement[0:3, 0:3], atol=1e-2):
+                placement_details["rotation"] = {
+                    "old": np.asarray(old_placement[:3, :3]).tolist(),
+                    "new": np.asarray(new_placement[:3, :3]).tolist(),
+                }
+            if placement_details:
+                placement_details["reason"] = "placement_changed"
+                self._record_geometry_change(new.GlobalId, placement_details)
                 return True
         elif has_placement(old) != has_placement(new):
+            self._record_geometry_change(
+                new.GlobalId, {"reason": "placement_missing", "missing_in": "new" if has_placement(old) else "old"}
+            )
             return True
         old_openings = sorted([o.RelatedOpeningElement.GlobalId for o in getattr(old, "HasOpenings", []) or []])
         new_openings = sorted([o.RelatedOpeningElement.GlobalId for o in getattr(new, "HasOpenings", []) or []])
         if old_openings != new_openings:
+            self._record_geometry_change(
+                new.GlobalId, {"reason": "openings_changed", "old": old_openings, "new": new_openings}
+            )
             return True
         old_projections = sorted([o.RelatedFeatureElement.GlobalId for o in getattr(old, "HasProjections", []) or []])
         new_projections = sorted([o.RelatedFeatureElement.GlobalId for o in getattr(new, "HasProjections", []) or []])
         if old_projections != new_projections:
+            self._record_geometry_change(
+                new.GlobalId, {"reason": "projections_changed", "old": old_projections, "new": new_projections}
+            )
             return True
         # Option 3: check completely using Python with get_info (extremely slow, not worth it)
         old_rep_id = self.get_representation_id(old)
         new_rep_id = self.get_representation_id(new)
         rep_result = self.representation_ids.get(new_rep_id, None)
         if rep_result is not None:
-           return rep_result
+            if rep_result:
+                self._record_geometry_change(new.GlobalId, {"reason": "shared_representation_changed"})
+            return rep_result
         if type(old_rep_id) != type(new_rep_id):
-           self.representation_ids[new_rep_id] = True
-           return True
+            self.representation_ids[new_rep_id] = True
+            self._record_geometry_change(
+                new.GlobalId,
+                {"reason": "representation_missing", "missing_in": "new" if old_rep_id is not None else "old"},
+            )
+            return True
         if new_rep_id is None:
-           return
+            return
         result = self.diff_representation(old_rep_id, new_rep_id, old.GlobalId) or False
         self.representation_ids[new_rep_id] = result
         return result
@@ -633,10 +659,20 @@ class IfcDiff:
     def diff_representation(self, old_rep_id: int, new_rep_id: int, global_id) -> bool:
         old_rep = self.old.by_id(old_rep_id)
         new_rep = self.new.by_id(new_rep_id)
-        if len(old_rep.Items) != len(new_rep.Items):
+        old_items = list(old_rep.Items or [])
+        new_items = list(new_rep.Items or [])
+        if len(old_items) != len(new_items):
+            self._record_geometry_change(
+                global_id,
+                {
+                    "reason": "representation_item_count_changed",
+                    "old_count": len(old_items),
+                    "new_count": len(new_items),
+                },
+            )
             return True
-        for i, old_item in enumerate(old_rep.Items):
-            result = self.diff_representation_item(old_item, new_rep.Items[i], global_id)
+        for old_item, new_item in zip(old_items, new_items):
+            result = self.diff_representation_item(old_item, new_item, global_id)
             if result is True:
                 return True
         return False
@@ -644,6 +680,14 @@ class IfcDiff:
     def diff_representation_item(
         self, old_item: ifcopenshell.entity_instance, new_item: ifcopenshell.entity_instance, global_id) -> bool:
         if old_item.is_a() != new_item.is_a():
+            self._record_geometry_change(
+                global_id,
+                {
+                    "reason": "representation_item_type_changed",
+                    "old_type": old_item.is_a(),
+                    "new_type": new_item.is_a(),
+                },
+            )
             return True
         
         diff = DeepDiff(
