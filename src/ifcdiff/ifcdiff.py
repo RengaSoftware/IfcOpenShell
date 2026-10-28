@@ -641,8 +641,11 @@ class IfcDiff:
         
         diff = DeepDiff(
             old_item.get_info(recursive=True),
-            new_item.get_info(recursive=True),                
-            math_epsilon=self.precision,
+            new_item.get_info(recursive=True),
+            significant_digits=6,
+            ignore_string_type_changes=True,
+            ignore_numeric_type_changes=True,
+            ignore_order=True,
             exclude_regex_paths=[r".*id']$"],
         )        
         if diff:
