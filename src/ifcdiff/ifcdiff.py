@@ -367,16 +367,16 @@ class IfcDiff:
             for global_id, old_shape in old_shapes.items():
                 new_shape = new_shapes.get(global_id, None)
                 if not new_shape:
-                    self.change_register.setdefault(global_id, {}).update({"geometry_changed": True})
+                    self._record_geometry_change(global_id, {"mesh_missing_in": "new"})
                     continue
                 del new_shapes[global_id]
                 diff = DeepDiff(old_shape, new_shape, math_epsilon=1e-5)
                 if diff:
-                    self.change_register.setdefault(global_id, {}).update({"geometry_changed": True})
+                    self._record_geometry_change(global_id, diff)
                     continue
 
             for global_id in new_shapes.keys():
-                self.change_register.setdefault(global_id, {}).update({"geometry_changed": True})
+                self._record_geometry_change(global_id, {"mesh_missing_in": "old"})
 
         print(" - {} item(s) were changed".format(len(self.change_register.keys())))
 
@@ -469,6 +469,8 @@ class IfcDiff:
             return list(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        if isinstance(obj, np.generic):
+            return obj.item()
         if type(obj).__name__ in ("SetOrdered", "OrderedSet"):
             return list(obj)
         return json.JSONEncoder.default(None, obj)
@@ -588,6 +590,11 @@ class IfcDiff:
                 if diff:
                     self.change_register.setdefault(new.GlobalId, {}).update({"inverse_relations_changes": diff})
                     return True
+
+    def _record_geometry_change(self, global_id: str, details) -> None:
+        entry = self.change_register.setdefault(global_id, {})
+        entry["geometry_changed"] = True
+        entry.setdefault("geometry_changed_details", details)
 
     def diff_element_basic_geometry(self, old, new):
         has_placement = lambda e: "ObjectPlacement" in getattr(e, "__dict__", {}) and e.ObjectPlacement is not None
